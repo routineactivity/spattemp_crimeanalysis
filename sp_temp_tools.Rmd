@@ -1,0 +1,383 @@
+---
+title: "Spatial-Temporal Tools for Crime Analysis"
+author: '@routineactivity'
+date: "21/10/2021"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: yes
+    toc_depth: 2
+---
+
+# Overview
+
+I've pieced together examples of some easy to use tools that are designed for crime analysts exploring changes in spatial patterns and observing temporal distributions of crime or public safety problems.  
+
+The three parts covered in this guide are:
+
+* [Crime Dispersion Calculator](https://github.com/jerryratcliffe/crimedispersion) can be used to measure how widespread increases in crime are. This tool can be used from macro-micro level, and when using within a single District/City could be applied to police divisions, neighbourhoods, artificial grids or even street segments to hone in more precisely on where crime or public safety problems are increasing.
+* [Spatial Point Pattern Tests](https://github.com/wsteenbeek/sppt) can be used to measure whether or not the spatial distribution of a problem is similar for two periods of time, regardless of whether or not there has been a change in the levels of the problem between those time periods - a stability measure. Whilst this can be used to explore changes between binary time periods, it could also be used for observing the spatial differences temporally (i.e. weekdays vs. weekend, seasons, space-times).
+* [Aoristic](https://github.com/cran/aoristic) a neat tool for visualising the distribution of crime and public safety problems by day/time. When working with internal data, the added benefit here is the package can deal with records where there is an elongated time span during which a crime may have occurred. This is often the case for property crimes such as burglary, vehicle crime, types of criminal damage and theft from person/stealth/pickpocket offences where there is often a committed from and to time parameter.
+
+# Libraries and data
+
+Libraries used as below.
+
+```{r libraries, message=FALSE, warning=FALSE}
+remotes::install_github("wsteenbeek/sppt")
+library(sppt)
+devtools::install_github("jerryratcliffe/crimedispersion")
+library(crimedispersion)
+library(sf) 
+library(tidyverse)
+library(spdplyr) # use dplyr with spatial/sp objects
+library(lubridate) # time/date mutations
+library(rio)
+library(aoristic)
+library(tmap) # mapping
+```
+
+An arbitrary choice, I chose to work with Nashville TN residence burglary crime data from the CODE (Crime Open Database) resource. The package can be accessed as shown below.
+
+```{r code data, message=FALSE, warning=FALSE}
+# install CODE
+#devtools::install_github("mpjashby/crimedata")
+#install.packages("crimedata")
+#library(crimedata)
+```
+
+Data can then be retrieved as shown below. For this guide I've already downloaded and saved an Rdata file containing the data. See further instructions on how to [access open crime data from code](https://cran.r-project.org/web/packages/crimedata/vignettes/introduction.html). 
+
+```{r nash burg data, message=FALSE, warning=FALSE}
+
+#nash_burg <- get_crime_data(
+#  years = 2014:2015,
+#  cities = "Nashville",
+#  type = "core",
+#  output = "sf"
+#) %>%
+#  filter(offense_group == "burglary/breaking & entering") %>%
+#  mutate(year = year(date_single)) %>%
+#  st_transform(st_as_sf(nash_burg, coords = c("longitude", "latitude"), crs = 4326), crs = 2274)
+
+load("df.RData") # this is the data file created from the code above
+```
+
+The data structure appears as shown below.
+
+```{r data table, message=FALSE, warning=FALSE}
+rmarkdown::paged_table(nash_burg[,])
+```
+
+Next, I imported polygon layers obtained from [Nashville Open Data Portal](https://data.nashville.gov/) - Census Tracts and Police Precincts. The Census Tracts is the unit of geography I chose to work with for the dispersion analysis. I have joined the polygon data to the point data using `st_join()`, and printed the result. The polygon and point data has been passed to a `ggplot` visual.
+
+```{r spatial files and data transformations, message=FALSE, warning=FALSE}
+# spatial layers
+# nashville polygon layers found at https://data.nashville.gov/
+nash_ct <- st_read("nashville_ct.geojson")
+nash_ctSP <- nash_ct %>% as(Class = "Spatial")
+nash_pd <- st_read("nashville_pd.geojson") %>% as(Class = "Spatial")
+
+# Join the Census Tract Data to points. I hadn't realised the CODE data does in fact include a census_block id, 
+# a merging of the US State (47), County (037), Tract (######), Blockgroup (#) and Name numeric codes.
+# Below is one way you can join polygon data to point data if needed. 
+nash_join <- st_join(nash_burg, nash_ct, join = st_intersects)
+
+# View data, note additional columns added with Census Tracts after joining
+rmarkdown::paged_table(nash_join[,])
+
+# View the census tract points and polygon data
+ggplot() +
+  geom_sf(data = nash_join, aes(geometry = geometry, colour = year), size = 1, ) +
+  geom_sf(data = nash_ct, aes(geometry = geometry, alpha = 0.1))
+
+```
+
+
+Whilst putting this together, I realised that the points for Nashville PD data are rounded coordinates with low geographic positioning accuracy. It is advisable to use more precise point data, particularly when it comes to using the Spatial Point Pattern Test.
+
+# Crime Dispersion
+
+This section of guide borrows from an online publication from Jerry Ratcliffe [How widespread are crime increases? Here is one analytical method](https://www.jratcliffe.net/post/how-widespread-are-crime-increases-here-is-one-analytical-method), which details how to prepare data for and use `crimedispersion`. This article will explain in more detail the underlying method and how to interpret the results. I've added some additional steps to extract the output data and return as a map visual to observe the dispersion geography.
+
+The data I am using it 2014 and 2015 burglary data in Nashville, during which time there was a rise in offences. Currently, `crimedispersion` only works when you have a crime increase. A count of data aggregated to a unit of geography for each time period is the first step required, as shown below.
+
+```{r cd dataprep, warning=FALSE, message=FALSE}
+# create a count table of all burglary in 2014 by census tract 
+nburg2014 <- nash_join %>%
+  as_tibble() %>%
+  filter(year == 2014 & location_category == "residence" & !is.na(TRACTCE)) %>%
+  group_by(TRACTCE) %>%
+  count()
+# create a count table of all burglary in 2015 by census tract
+nburg2015 <- nash_join %>%
+  as_tibble() %>%
+  filter(year == 2015 & location_category == "residence"& !is.na(TRACTCE)) %>%
+  group_by(TRACTCE) %>%
+  count()
+```
+
+
+There were 3,900 residence burglaries in 2014 and 4,117 in 2015.
+
+```{r nashburg sum, warning=FALSE, message=FALSE}
+# sum totals
+sum(nburg2014$n)
+sum(nburg2015$n)
+# how data structure should look
+#head(nburg2014)
+```
+
+Once you have calculated aggregated totals for the units of geography under study, the two tables must be merged together to create a data frame that can be passed to `crimedispersion()`. The code below merges the two data sets and prints the result so that you can see the data structure result required.
+
+```{r nashburg merge, warning=FALSE, message=FALSE}
+# merge 2014 and 2015 data together so each year total is shown by census tract
+nburg_yoy <- nburg2014 %>%
+  full_join(nburg2015, by = 'TRACTCE') %>%
+  rename(count2014 = n.x, count2015 = n.y) %>%
+  mutate_if(is.numeric, coalesce,0) %>%
+  as.data.frame()
+# data structure
+head(nburg_yoy)
+```
+
+Pass the data frame to `crimedispersion()` using the object name `nburg_yoy` and the three column headers, and assign as a new object, here named `output`. There are 5 results outputs generated. I've assigned `output[[1]]` has to `new.df`, and printed for you to view. They show eight columns including the number of offences before and after for the unit of study (Census Tract) and the for the region (Nashville PD). The results are rank ordered in descending order of importance. As each unit is removed we can observe how that affects the numeric change and percentage change. 
+
+```{r cdnb, message=FALSE, warning=FALSE}
+# run crimedispersion
+output <- crimedispersion(nburg_yoy, 'TRACTCE', 'count2014', 'count2015')
+# assign output 1 to new df
+new.df <- output[[1]]
+# view new.df, see https://www.jratcliffe.net/post/how-widespread-are-crime-increases-here-is-one-analytical-method 
+# for explanation of column headers, they show before and after for tract, for nashville, and numeric and % changes for the region AS each TRACT is removed - i.e. removing Tract 010702 changes the increase in Nashville from +5.56% to +4.71%, removing the next ranked Tract is +3.89% etc
+rmarkdown::paged_table(new.df[,])
+```
+
+`output[[3]]` shows the number of units that have to be removed for the crime rate to go from an increase to a reduction. In this case it is just 9 of 157 Census Tracts in Nashville.
+
+```{r output3, warning=FALSE, message=FALSE}
+output[[3]]
+```
+There are two other measures provided, the ODI (Offence Dispersion Index - `output[[4]]`) and the NCDI (Non Contributory Dispersion Index - `output[[5]]`). ODI is the ratio of all units that have to be removed to reverse the increase (9/157), which is just under 6% (0.05732484). The NCDI is the ratio of all units that had increases, though were not central to the crime increase (72/157), which is just under 46% (0.4585987).
+
+Those areas which make up the ODI (9 Census Tracts) might be considered as emerging problem areas (EPAs). These can be used in a further crime calculation, the [Crime Concentration Dispersion Index](https://discovery.ucl.ac.uk/id/eprint/10067258/), not covered in this guide but here for information. 
+
+```{r odincdi, warning=FALSE, message=FALSE}
+#Offence Dispersion Index
+output[[4]]
+#Non Contributory Dispersion Index
+output[[5]]
+```
+`Output[[2]]` will produce an automated plot of the dispersion. On its own, we can see that to zero out the crime increase requires changing levels of burglary in 9 of 157 Census Tracts.
+
+```{r dispersionplot, warning=FALSE, message=FALSE}
+output[[2]]
+```
+
+If you want to see the distribution geographically, we can add the outputs data to the Census Tract spatial object. I've done this quickly with `ggplot2` as an example. Other popular options are `tmap` or `leaflet`, or you may export for viewing in other software. We can see those Census Tracts contributing most to the burglary increase in Nashville during 2015 were clustered together in three areas of the city.
+
+```{r cdspatial}
+# join output variables in the Nashville Census Tract spatial object, using the census tract ID as a primary key
+nash_ct$outputs <- left_join(nash_ct, new.df, by = c("TRACTCE" = "unit"))
+# view as ggplot - could also use other packages, my preference is usually tmap or leaflet
+ggplot(nash_ct, aes(fill = outputs$pct)) +
+  geom_sf() +
+  scale_fill_gradient(low = "white", high = "black")
+```
+
+# Spatial Point Pattern Test
+
+`sppt` requires data in a spatial format so we are going to create two new objects. These are time series for 2014 Nashville residence burglaries `points_t1` and time series for 2015 Nashville residence burglaries `points_t2`, as shown below.
+
+```{r sppt data, warning=FALSE, message=FALSE}
+# create time 1 and time 2 spatial objects
+points_t1 <- nash_join %>% filter(year == 2014) %>% as(Class = "Spatial")
+points_t2 <- nash_join %>% filter(year == 2015) %>% as(Class = "Spatial")
+```
+
+The next stage requires us to determine the number of spatial units that we will divide the study region into. At this point I realise the Nashville PD data points are rounded coordinates, clipped to I suspect a CAD grid for the city. I have therefore determined the number of spatial units through trial and error, creating units of approximately 1,300 meters / 4280 feet using `st_make_grid()`.
+
+An online guide is available suggesting how to determine spatial sizes, [Spatial sample size suggestions for SPPT analysis](https://andrewpwheeler.com/2021/07/03/spatial-sample-size-suggestions-for-sppt-analysis/). Coupled with this is a guide to using SPPT looking at the recent increase in NYC Shootings either side of March 2020, see [Spatial analysis of NYC Shootings using the SPPT](https://andrewpwheeler.com/2021/07/07/spatial-analysis-of-nyc-shootings-using-the-sppt/).
+
+```{r sppt units, warning=FALSE, message=FALSE}
+# making a grid to count number of offences in time 1 and time 2
+area <- st_make_grid(nash_join, cellsize = 4280) %>% as(Class = "Spatial")
+```
+
+This section borrows from the `sppt` guidance documentation [Introduction to Spatial Point Pattern Test](http://htmlpreview.github.io/?https://github.com/wsteenbeek/sppt/blob/master/doc/sppt_intro.html),  Martin Andresen and Wouter Steenbeek. This explains the methods and results in further detail. I would encourage that you take the time to refer to this for understanding.
+
+The code below shows outputs being assigned to the three options `sppt()`, `sppt_boot()` and `sppt_diff()`. I am only moving forward using `sppt()` in this example. Calling the summary produces two statistics, the globalS.standard and globalS.robust. The global S standard value includes each unit (geographic area, areal unit) that has zero Base or Test (points_t1 or points_t2) events. The global S robust value only considers areas where at least one event occurred in either Base or Test (points_t1 or points_t2).
+
+```{r sppttests, warning=FALSE, message=FALSE}
+
+set.seed(39346) # set seed for reproducibility
+
+# assign output from sppt()
+output1 <- sppt(points_t1, points_t2, area)
+
+#assign output from sppt_boot()
+#output2 <- sppt_boot(points_t1, points_t2, area)
+#assign output from sppt_diff()
+#output3 <- sppt_diff(points_t1, points_t2, area)
+
+#summarise output
+summary_sppt(output1)
+```
+
+We can assign the output to a data frame to view.
+
+```{r opdf, warning=FALSE, message=FALSE}
+# assing output data to dataframe
+output1df <- as_tibble(output1)
+# view
+#view(output1df)
+```
+
+If we plot the localS value from the output, this will indicate a unit area with a significant increase (1), significant decrease (-1) and no change (0).
+
+```{r spptplot, warning=FALSE, message=FALSE}
+plot(output1, lty="blank")
+plot(output1[which(output1$localS == -1), ], col = "#2c7bb6", lty="blank", add = TRUE)
+plot(output1[which(output1$localS == 1 & output1$NumTstPts), ], col = "#d7191c", lty="blank", add = TRUE)
+plot(output1[which(output1$localS == 0), ], col = NA, lty="blank", add = TRUE)
+plot(nash_ctSP, col = NA, perc = 100, border = "black", lwd = 1, add = TRUE)
+```
+
+This plot is noisy and it would be difficult to use for decision making or targeting. To communicate more effectively, we'll filter the results with a threshold and create an interactive plot. For this I will highlight units displaying a significant increase in residence burglaries, and containing more than 12 offences in 2015 - non-scientific threshold, I've gone for areas with an average of 1+ per month. Although not a polished visual, below we can identify a large contiguous area in Nashville South Precinct, and on zooming in we can see it falls between the Nolensville Pike/Road and I24.
+
+```{r spptinteractive, warning=FALSE, message=FALSE}
+
+# create a logical variable for cells that have an average of 1 offence per month, no science here just an arbitrary decision
+output1$logical <- ifelse(output1$localS == 1 & output1$NumTstPts >12, TRUE, FALSE )
+
+# set tmap to view mode
+tmap_mode("view")
+
+# plot the output1 shape with nashville police divisions
+tm_shape(output1) + 
+  tm_fill("logical", palette = c("#00000000", "red"), alpha = 0.6, legend.show = FALSE) + 
+  tm_shape(nash_pd) +
+  tm_borders()
+```
+
+We could add a layer to identify residence burglary crime concentration across the units. We can view the crime concentration across units by creating a cumulative frequency table and rank ordering by volume of offences. We can see that the first 30 rows (30 of 1296 geographic units, 2% of Nashville) contained almost a third of all residence burglaries - these 30 have the highest crime concentration.
+
+```{r cftab, warning=FALSE, message=FALSE}
+# cumulative frequency table output
+cfoutput <- output1df %>%
+  select(uoa_id, NumTstPts) %>%
+  arrange(desc(NumTstPts)) %>%
+  mutate(cf = cumsum(NumTstPts)) %>%
+  mutate(cfpc = cf / sum(NumTstPts))
+# view
+rmarkdown::paged_table(cfoutput[1:30,])
+```
+
+If we map this we can observe where high crime concentrations and significant increases overlap. There look to be around 10 areas or groups of units where there was a significant increase and high crime concentration in 2015. This provides a focus for where to look next, analysts may follow up with hot spot and problem solving analysis of those areas for example.
+
+```{r map2, warning=FALSE, message=FALSE}
+# create a logical variable for cells that have a high crime concentration, NumTstPts >39
+output1$logical2 <- ifelse(output1$NumTstPts >39, TRUE, FALSE)
+# create a high crime concentration layer to add to tmap
+highcc <- output1 %>% filter(output1@data$logical2 == TRUE)
+
+# load tmap and set to view mode
+library(tmap)
+tmap_mode("view")
+
+# plot the output1 shape with nashville police divisions
+tm_shape(output1) + 
+  tm_fill("logical", palette = c("#00000000", "red"), alpha = 0.8, legend.show = FALSE) +
+  tm_shape(highcc) +
+  tm_borders(lwd = 4) +
+  tm_shape(nash_pd) +
+  tm_polygons(border.col = "black", col = NA, alpha = .5, lwd = 2, popup.vars = "precinct")
+
+```
+
+# Aoristic
+
+Facilitating an often used method in crime analysis, `aoristic` is a nice quick way to develop a data clock or temporal heat map. Data required are geographic coordinates and date/time from and to - please note there is only a committed time from available with the Nashville TN residence burglary data. The code block below prepares the data in the required format. An example of one method you may use to filter the data is provided, simply using the coordinates from a bounding box of the South Precinct area highlighted in the previous section.
+
+```{r aoristicdata, warning = FALSE, message=FALSE}
+# setup data for using aoristic
+aoristic_df <- nash_burg %>%
+  select(latitude, longitude, date_single) %>%
+  rename(Xcoord = latitude, Ycoord = longitude, DateTimeFrom = date_single) %>%
+  mutate(DateTimeTo = DateTimeFrom) %>%
+  as.data.frame()
+
+# subset of data for south precint high and emerging burglary
+adf_southpct <- aoristic_df %>%
+  filter(Xcoord >= 36.070664 & Xcoord <= 36.126145 | Ycoord >= -86.750622 & Ycoord <= -86.691914)
+
+#bbox coords for south precinct area around i24 -86.750622,36.070664,-86.691914,36.126145
+```
+
+Check the data for errors and missing data using `aoristic.datacheck()`.
+
+```{r aoristicdatacheck, warning=FALSE, message=FALSE}
+
+datacheck.df <- aoristic.datacheck(aoristic_df, 'Xcoord', 'Ycoord', 'DateTimeFrom', 'DateTimeTo')
+
+```
+
+Assuming all in order, pass the data to `aoristic.df()`. This calculates the weights for each hour of the week. We can then pass this to `aoristic.summary()` which returns a sum of weights for each hour of the week. The table below shows the result from the summary for South Precinct residence burglaries.
+
+```{r aodf, warning=FALSE, message=FALSE}
+
+# All Nashville residence burglary
+NVaodf <- aoristic.df(aoristic_df, 'Xcoord', 'Ycoord', 'DateTimeFrom', 'DateTimeTo')
+
+# South Precinct hotspots
+SPaodf <- aoristic.df(adf_southpct, 'Xcoord', 'Ycoord', 'DateTimeFrom', 'DateTimeTo')
+
+
+# All Nashville residence burglary aoristic summary
+NVas <- aoristic.summary(NVaodf)
+
+# South Precinct residence burglary aoristic summary
+SPas <- aoristic.summary(SPaodf)
+
+# Example output table
+rmarkdown::paged_table(SPas[,])
+
+```
+
+`aoristic.graph()` will return bar charts showing the hourly patterns per day and overall and `aoristic.plot()` will return a heatmap for all 168 hours in the week.
+
+
+```{r aographs, warning=FALSE, message=FALSE}
+
+# aoristic graph shows time patterns for each day
+aoristic.graph(NVas, marks = FALSE)
+
+# aoristic plot provides as a heatmap
+aoristic.plot(NVaodf)
+```
+
+You may wish to explore other visual options in `ggplot`, this can be done by transforming the aoristic summary table from wide to long data and then plotting - unpolished example shown below. A more advanced method might be to produce an interactive time-space map, a tutorial on how to do this can be found in the [Crime Mapping course by Matt Ashby](https://github.com/mpjashby/crimemapping/blob/main/inst/tutorials/16_mapping_time/images/chicago_animated_kde.gif).
+
+
+```{r ggplotas, warning=FALSE, message=FALSE}
+
+# line chart in ggplot2
+p3 <- SPas %>% pivot_longer(!Range, names_to = "day", values_to = "offs") %>%
+  ggplot(aes(x = Range, y = offs, group = day, colour = day )) +
+  geom_line() +
+  theme(axis.text.x = element_text(angle = 90))
+  
+
+p3
+```
+
+
+
+# Learn more
+
+* [How widespread are crime increases? Here is one analytical method, Jerry Ratcliffe](https://www.jratcliffe.net/post/how-widespread-are-crime-increases-here-is-one-analytical-method)
+* [Introduction to Spatial Point Pattern Test, M. Andresen and W. Steenbeek](http://htmlpreview.github.io/?https://github.com/wsteenbeek/sppt/blob/master/doc/sppt_intro.html)
+* [Spatial analysis of NYC Shootings using the SPPT, Andrew Wheeler](https://andrewpwheeler.com/2021/07/07/spatial-analysis-of-nyc-shootings-using-the-sppt/)
+* [Spatial sample size suggestions for SPPT analysis, Andrew Wheeler](https://andrewpwheeler.com/2021/07/03/spatial-sample-size-suggestions-for-sppt-analysis/)
+* [Understanding Crime: Analyzing the Geography of Crime, Spencer Chainey](https://www.amazon.co.uk/Understanding-Crime-Analyzing-Geography/dp/158948584X) - for the techniques discussed above, more detailed guidance can be found in Chapter 4: The Temporal Analysis of Crime and Chapter 6: Persistent, emerging and dispersed patterns of crime.
